@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         AWBW Capture Tracker
 // @namespace    awbw-capture-tracker
-// @version      1.1.0
+// @version      1.2.0
 // @description  Shows property captures in progress (points left, ETA), capture-limit progress and income now vs. projected on Advance Wars By Web.
 // @homepageURL  https://github.com/ctrlc03/awbw-assist
 // @supportURL   https://github.com/ctrlc03/awbw-assist/issues
 // @updateURL    https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-capture-tracker.user.js
 // @downloadURL  https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-capture-tracker.user.js
 // @match        https://awbw.amarriner.com/game.php*
+// @match        https://awbw.amarriner.com/moveplanner.php*
 // @run-at       document-idle
 // @grant        none
 // @sandbox      raw
@@ -34,13 +35,16 @@
   //   Port and HQ. Com Towers and Labs give none (verified against players_income; AWBW CO chart for Sasha:
   //   "labs, comtowers ... do not get additional income"). Sasha gets +100 per income property.
 
+  const PLANNER = location.pathname.endsWith("/moveplanner.php");
   if (!document.getElementById("gamemap")) return;
   const GAME_ID = +new URLSearchParams(location.search).get("games_id");
-  if (!GAME_ID) return;
+  if (!GAME_ID) return; // also covers moveplanner.php?maps_id=
+  if (PLANNER && (typeof unitsInfo === "undefined" || !unitsInfo)) return; // eslint-disable-line no-undef
 
   const LOG = "[AWBW capture tracker]";
   const TILE = 16;
   const POLL_MS = 1000;
+  const PLANNER_POLL_MS = 500;
   const FULL = 20;
   const STORE = "awbw-ct:";
   const INCOME_TYPES = new Set(["City", "Base", "Airport", "Port", "HQ"]);
@@ -68,19 +72,19 @@
   // ---------------------------------------------------------------------------
 
   function propertyType(terrainName) {
-    const m = /(HQ|Airport|Port|Base|City|Lab|Com Tower)$/.exec(terrainName || "");
-    return m ? m[1] : null;
+    const m = /(HQ|Airport|Port|Base|City|Lab|Com Tower)$/i.exec(terrainName || "");
+    if (!m) return null;
+    const t = m[1].toLowerCase();
+    return t === "hq" ? "HQ" : t === "com tower" ? "Com Tower" : t[0].toUpperCase() + t.slice(1);
   }
 
   // Game settings table (#showinfo) is the only place the funds-per-property / capture-limit values are exposed.
+  // The planner page has no such table: it fetches the game page once (same origin) and caches the two values.
   let settingsCache = null;
-  function readSettings() {
-    if (settingsCache) return settingsCache;
+  function parseSettings(rows) {
     const out = { funds: null, captureLimit: null };
     let found = false;
-    for (const td of document.querySelectorAll("#showinfo td")) {
-      const label = td.textContent.trim();
-      const val = td.nextElementSibling ? td.nextElementSibling.textContent.trim() : "";
+    for (const [label, val] of rows) {
       if (label === "Funds:") {
         out.funds = num(val.replace(/[^\d]/g, "") || null);
         found = true;
@@ -89,13 +93,54 @@
         found = true;
       }
     }
-    if (out.captureLimit == null) {
-      // Fallback: inline constant (the page uses 1000 for "Off").
-      const c = num(G.captureLimit());
-      if (!found && c != null && c > 0 && c < 1000) out.captureLimit = c;
+    return found ? out : null;
+  }
+  function readSettings() {
+    if (settingsCache) return settingsCache;
+    if (PLANNER) return { funds: null, captureLimit: null };
+    const rows = [];
+    for (const td of document.querySelectorAll("#showinfo td")) rows.push([td.textContent.trim(), td.nextElementSibling ? td.nextElementSibling.textContent.trim() : ""]);
+    const out = parseSettings(rows);
+    if (out) {
+      settingsCache = out;
+      return out;
     }
-    if (found) settingsCache = out;
-    return out;
+    // Table not on the page: fall back to the inline constant (the page uses 1000 for "Off").
+    const c = num(G.captureLimit());
+    return { funds: null, captureLimit: c != null && c > 0 && c < 1000 ? c : null };
+  }
+
+  let remoteRequested = false;
+  async function loadRemoteSettings() {
+    if (remoteRequested || settingsCache) return;
+    remoteRequested = true;
+    const key = STORE + "settings:" + GAME_ID;
+    try {
+      const cached = JSON.parse(localStorage.getItem(key) || "null");
+      if (cached && "funds" in cached) {
+        settingsCache = cached;
+        update();
+        return;
+      }
+    } catch (_) {}
+    try {
+      const res = await fetch("game.php?games_id=" + GAME_ID, { credentials: "same-origin" });
+      if (!res.ok) return;
+      const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+      const rows = [];
+      for (const td of doc.querySelectorAll("#showinfo td")) rows.push([td.textContent.trim(), td.nextElementSibling ? td.nextElementSibling.textContent.trim() : ""]);
+      const out = parseSettings(rows);
+      if (!out) return;
+      settingsCache = out;
+      if (ui.enabled) {
+        try {
+          localStorage.setItem(key, JSON.stringify(out));
+        } catch (_) {}
+        update();
+      }
+    } catch (err) {
+      console.warn(LOG, "could not read game settings for the planner", err);
+    }
   }
 
   function captureRate(unit, player) {
@@ -109,18 +154,38 @@
   }
 
   function displayedIncome(pid) {
-    const el = document.querySelector("#player" + pid + " .player-income");
+    const el = PLANNER ? null : document.querySelector("#player" + pid + " .player-income");
     const t = el ? el.textContent.trim() : "";
     if (/^\d+$/.test(t)) return +t;
     const info = G.playersInfo() && G.playersInfo()[pid];
     return info && num(info.players_income) != null ? +info.players_income : null;
   }
 
+  // Planner: units created in the planner may lack units_players_id; fall back to the country code.
+  function unitPid(unit, players) {
+    if (unit.units_players_id != null && players[unit.units_players_id]) return String(unit.units_players_id);
+    const pi = G.playersInfo() || {};
+    for (const pid in pi) if (pi[pid].countries_code === unit.countries_code) return String(pid);
+    return unit.units_players_id != null ? String(unit.units_players_id) : null;
+  }
+
+  // Planner: "Change building" only rewrites terrain_name/terrain_country_code (buildings_players_id stays), so the
+  // country code wins when present ("neutral" = unowned).
+  function ownerOf(b, players) {
+    if (PLANNER && typeof b.terrain_country_code === "string") {
+      if (b.terrain_country_code === "" || b.terrain_country_code === "neutral") return "";
+      const pi = G.playersInfo() || {};
+      for (const pid in pi) if (pi[pid].countries_code === b.terrain_country_code) return String(pid);
+      return "";
+    }
+    return b.buildings_players_id == null ? "" : String(b.buildings_players_id);
+  }
+
   function buildModel() {
     const bi = G.buildingsInfo();
     const pi = G.playersInfo();
     if (!bi || !pi) return null;
-    const um = G.unitMap() || {};
+    const um = PLANNER ? {} : G.unitMap() || {};
     const ui = G.unitsInfo() || {};
     const turn = G.currentTurn();
     const settings = readSettings();
@@ -150,6 +215,16 @@
     }
     const teamOf = (pid) => (pid !== "" && players[pid] ? players[pid].team : null);
 
+    const plannerUnits = new Map();
+    if (PLANNER) {
+      for (const k in ui) {
+        const u = ui[k];
+        if (!u || u.units_carried === "Y") continue;
+        const key = u.units_x + "," + u.units_y;
+        const prev = plannerUnits.get(key);
+        if (!prev || (FOOT.has(u.units_name) && !FOOT.has(prev.units_name)) || (u.units_capture === 1 && prev.units_capture !== 1 && FOOT.has(u.units_name))) plannerUnits.set(key, u);
+      }
+    }
     const caps = [];
     for (const xs in bi) {
       const col = bi[xs];
@@ -158,7 +233,7 @@
         if (!b) continue;
         const type = propertyType(b.terrain_name);
         if (!type) continue;
-        const owner = b.buildings_players_id == null ? "" : String(b.buildings_players_id);
+        const owner = ownerOf(b, players);
         if (owner !== "" && players[owner]) {
           const P = players[owner];
           P.owned++;
@@ -169,13 +244,14 @@
         if (left == null || left >= FULL) continue;
         const x = +xs;
         const y = +ys;
-        const uRef = um[x] && um[x][y];
-        const unit = uRef ? ui[uRef.units_id] : null;
-        const capPid = unit ? String(unit.units_players_id) : null;
+        const unit = PLANNER ? plannerUnits.get(x + "," + y) || null : um[x] && um[x][y] ? ui[um[x][y].units_id] : null;
+        const capPid = unit ? unitPid(unit, players) : null;
         const capP = capPid != null ? players[capPid] : null;
+        // Planner quirk: capturing a property of the capturer's own team still decrements buildings_capture; not a real capture.
+        if (PLANNER && capP && owner !== "" && players[owner] && players[owner].team === capP.team) continue;
         const hp = unit ? num(unit.units_hit_points) : null;
         const rate = captureRate(unit, capP);
-        const turns = rate == null || rate <= 0 ? null : rate === Infinity ? 1 : Math.ceil(left / rate);
+        const turns = rate == null ? null : rate === Infinity ? (left <= 0 ? 0 : 1) : left <= 0 ? 0 : rate <= 0 ? null : Math.ceil(left / rate);
         const now = !!capP && String(turn) === capPid && unit && unit.units_moved !== 1 && unit.units_moved !== "1";
         caps.push({
           key: x + "," + y,
@@ -184,7 +260,7 @@
           buildingId: b.buildings_id,
           type,
           income: INCOME_TYPES.has(type),
-          left,
+          left: Math.max(0, left), // planner can go below 0 (planned capture already complete)
           owner,
           capPid,
           unitId: unit ? +unit.units_id : null,
@@ -215,6 +291,19 @@
 
     // Income: displayed value is authoritative; rate per property comes from the game setting (+100 for Sasha),
     // falling back to displayed income / income properties when the setting cannot be read.
+    // Rate shared by most players (used when a player has no income property to infer from, e.g. in the planner where the
+    // game settings are not on the page and no setting was fetched yet).
+    const votes = {};
+    for (const pid of order) {
+      const P = players[pid];
+      const d = displayedIncome(pid);
+      if (d != null && P.incomeProps > 0 && d % P.incomeProps === 0) {
+        const r = d / P.incomeProps - (P.co === "Sasha" ? 100 : 0);
+        votes[r] = (votes[r] || 0) + 1;
+      }
+    }
+    const best = Object.keys(votes).sort((a, b) => votes[b] - votes[a])[0];
+    const modeRate = best != null ? +best : null;
     for (const pid of order) {
       const P = players[pid];
       P.displayed = displayedIncome(pid);
@@ -228,8 +317,8 @@
         }
       }
       if (rate == null) {
-        rate = 1000;
-        source = "assumed 1000";
+        rate = modeRate != null ? modeRate : 1000;
+        source = modeRate != null ? "most common rate among players" : "assumed 1000";
       }
       P.rate = rate;
       P.rateSource = source;
@@ -249,13 +338,16 @@
 
   function etaLabel(c) {
     if (c.turns == null) return "?";
-    if (c.turns === 1) return c.now ? "this turn" : "next turn";
-    return c.turns + " turns";
+    if (c.turns === 0) return "planned ✓";
+    if (c.turns === 1) return PLANNER ? "1 more" : c.now ? "this turn" : "next turn";
+    return c.turns + (PLANNER ? " more" : " turns");
   }
 
   function etaTitle(c) {
     if (c.turns == null) return "Capturer HP is hidden or unknown";
+    if (c.turns === 0) return "Planned capture is complete: the planner does not change the owner, but the projected income counts it";
     const how = c.rate === Infinity ? "instant (Sami SCOP active)" : `${c.rate} pt/turn (capturer HP ${c.hp}${c.rate !== c.hp ? ", Sami +50%" : ""})`;
+    if (PLANNER) return `${c.left} pts left at ${how} → ${c.turns} more capture action${c.turns === 1 ? "" : "s"}`;
     return `${c.left} pts left at ${how} → ${c.turns} capture action${c.turns === 1 ? "" : "s"}; ` + (c.now ? "first one can be done this turn" : "first one at the capturer's next turn");
   }
 
@@ -481,6 +573,7 @@
       return;
     }
     ui.sig = "";
+    if (PLANNER) loadRemoteSettings();
     update();
   }
 
@@ -494,7 +587,7 @@
     p.id = "ct-panel";
     if (ui.minimized) p.classList.add("ct-min");
     p.innerHTML = `
-      <div class="ct-head"><span class="ct-title">Captures</span><span class="ct-status"></span><span class="ct-toggle"></span></div>
+      <div class="ct-head"><span class="ct-title">${PLANNER ? "Captures (planner)" : "Captures"}</span><span class="ct-status"></span><span class="ct-toggle"></span></div>
       <div class="ct-body">
         <div class="ct-controls">
           <select class="ct-filter" title="Show only captures involving this player"><option value="">All players</option></select>
@@ -558,7 +651,7 @@
       const tr = e.target.closest("tr[data-key]");
       if (!tr) return;
       const c = ui.model && ui.model.caps.find((k) => k.key === tr.getAttribute("data-key"));
-      const span = c && document.querySelector(`#gamemap span[data-building-id='${c.buildingId}']`);
+      const span = c && (document.querySelector(`#gamemap span[data-building-id='${c.buildingId}']`) || document.getElementById("building_" + c.buildingId));
       if (span && span.scrollIntoView) span.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
     });
     awbwMountPanel({ key: "ct", panel: p, header: p.querySelector(".ct-head"), onEnabled: setEnabled });
@@ -614,7 +707,7 @@
       el.style.setProperty("--ct-c", markColor(m, c));
       el.classList.toggle("ct-hq", c.type === "HQ");
       el.classList.toggle("ct-hl", ui.hover === c.key);
-      const eta = c.turns == null ? "?" : c.rate === Infinity ? "⚡" : c.turns + "t";
+      const eta = c.turns == null ? "?" : c.rate === Infinity ? "⚡" : c.turns === 0 ? "✓" : c.turns + "t";
       const html = `<span class="ct-pill"><i class="ct-pts">${c.left}</i><i class="ct-eta">${eta}</i></span>`;
       if (el.innerHTML !== html) el.innerHTML = html;
     }
@@ -710,8 +803,8 @@
     const who = (m, c) => (c.capPid != null ? pname(m, c.capPid) : "?");
     for (const c of cur.caps) {
       const o = pk.get(c.key);
-      if (!o) out.push(`${day}${who(cur, c)} started capturing ${c.type} (${c.x},${c.y}): ${c.left} left`);
-      else if (o.left !== c.left) out.push(`${day}${who(cur, c)} capturing ${c.type} (${c.x},${c.y}): ${c.left} left`);
+      if (!o) out.push(`${day}${who(cur, c)} ${c.left <= 0 ? "planned a capture of" : "started capturing"} ${c.type} (${c.x},${c.y}): ${c.left} left`);
+      else if (o.left !== c.left) out.push(`${day}${who(cur, c)} ${c.left <= 0 ? "completes" : "capturing"} ${c.type} (${c.x},${c.y}): ${c.left} left`);
     }
     for (const o of prev.caps) {
       if (ck.has(o.key)) continue;
@@ -733,6 +826,7 @@
       m.caps.map((c) => [c.key, c.left, c.owner, c.capPid, c.unitId, c.hp, c.rate === Infinity ? "i" : c.rate, c.turns, c.now]),
       m.list.map((p) => [p.pid, p.name, p.eliminated, p.owned, p.incomeProps, p.displayed, p.rate, p.gain, p.loss, p.gainAll, p.lossAll, p.power]),
       m.settings.captureLimit,
+      m.settings.funds,
       G.viewerPId(),
     ]);
   }
@@ -800,12 +894,26 @@
 
   // ---- boot -------------------------------------------------------------------
 
-  buildUI();
-  update();
-  setInterval(update, POLL_MS);
-  (async () => {
-    for (let i = 0; i < 50 && !installHooks(); i++) await new Promise((r) => setTimeout(r, 200));
-    if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; relying on polling only");
+  buildUI(); // mounting the panel calls setEnabled with the remembered on/off state
+  if (PLANNER) {
+    // The planner has no actionHandlers: it mutates unitsInfo/buildingsInfo in place, so poll (cheap, signature-compared)
+    // and refresh right after any click (planned capture/move/delete) instead of waiting for the next tick.
+    setInterval(update, PLANNER_POLL_MS);
+    document.addEventListener(
+      "click",
+      () => {
+        schedule();
+        setTimeout(update, 120);
+      },
+      true
+    );
+  } else {
     update();
-  })().catch((err) => console.error(LOG, err));
+    setInterval(update, POLL_MS);
+    (async () => {
+      for (let i = 0; i < 50 && !installHooks(); i++) await new Promise((r) => setTimeout(r, 200));
+      if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; relying on polling only");
+      update();
+    })().catch((err) => console.error(LOG, err));
+  }
 })();

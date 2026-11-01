@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         AWBW Unit Kill Tracker
 // @namespace    awbw-kill-tracker
-// @version      1.2.0
+// @version      1.3.0
 // @description  Tracks kills and damage dealt per unit on Advance Wars By Web (ongoing and finished games).
 // @homepageURL  https://github.com/ctrlc03/awbw-assist
 // @supportURL   https://github.com/ctrlc03/awbw-assist/issues
 // @updateURL    https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-kill-tracker.user.js
 // @downloadURL  https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-kill-tracker.user.js
 // @match        https://awbw.amarriner.com/game.php*
+// @match        https://awbw.amarriner.com/moveplanner.php*
 // @run-at       document-idle
 // @grant        none
 // @sandbox      raw
@@ -271,14 +272,47 @@
   const MAX_STORED_GAMES = 30;
 
   // Page globals declared with let/const are reachable by bare name only (no window property).
+  // Move Planner: a local sandbox of the game (moveplanner.js, no game.js). Its unitsInfo holds
+  // hypothetical positions, so history comes from the replay only and there are no live hooks.
+  const IS_PLANNER = /\/moveplanner\.php$/.test(location.pathname);
   const page = {
-    unitsInfo: () => (typeof unitsInfo !== "undefined" ? unitsInfo : null), // eslint-disable-line no-undef
+    unitsInfo: () => (!IS_PLANNER && typeof unitsInfo !== "undefined" ? unitsInfo : null), // eslint-disable-line no-undef
     playersInfo: () => (typeof playersInfo !== "undefined" ? playersInfo : null), // eslint-disable-line no-undef
     viewerPId: () => (typeof viewerPId !== "undefined" ? viewerPId : 0), // eslint-disable-line no-undef
   };
   const GAME_ID = +new URLSearchParams(location.search).get("games_id");
-  if (!GAME_ID) return;
-  const STORE_KEY = STORE_PREFIX + GAME_ID + ":" + (page.viewerPId() || 0);
+  if (!GAME_ID) return; // also skips the map planner (moveplanner.php?maps_id=N)
+  const STORE_KEY = IS_PLANNER ? plannerStoreKey() : STORE_PREFIX + GAME_ID + ":" + (page.viewerPId() || 0);
+
+  // The planner has no viewer id: reuse this game's most recently used history (the one built on game.php).
+  function plannerStoreKey() {
+    const prefix = STORE_PREFIX + GAME_ID + ":";
+    let index = [];
+    try {
+      index = JSON.parse(localStorage.getItem(STORE_INDEX) || "[]");
+    } catch (_) {}
+    const mine = index.filter((k) => k.startsWith(prefix));
+    return mine.length ? mine[mine.length - 1] : prefix + "0";
+  }
+
+  // Unit spans: game.php uses span[data-unit-id]; the planner uses span#unit_<id> (plus #unit_<id>leftIcon/rightIcon children).
+  const PLANNER_UNIT_ID = /^unit_(\d+)$/;
+  function unitIdOf(span) {
+    if (!IS_PLANNER) return span.getAttribute("data-unit-id");
+    const m = PLANNER_UNIT_ID.exec(span.id);
+    return m ? m[1] : null;
+  }
+  function unitSpans() {
+    if (!IS_PLANNER) return document.querySelectorAll("#gamemap span[data-unit-id]");
+    return [...document.querySelectorAll("#gamemap span[id^='unit_']")].filter((s) => PLANNER_UNIT_ID.test(s.id));
+  }
+  function unitSpanAt(el) {
+    for (; el && el.id !== "gamemap"; el = el.parentElement) if (el.tagName === "SPAN" && unitIdOf(el)) return el;
+    return null;
+  }
+  function unitSpanById(id) {
+    return IS_PLANNER ? document.getElementById("unit_" + id) : document.querySelector(`#gamemap span[data-unit-id='${id}']`);
+  }
 
   const T = {
     turns: {}, // idx -> Map(key -> event)
@@ -905,8 +939,8 @@
     document.body.appendChild(ui.tip);
     const map = document.getElementById("gamemap");
     map.addEventListener("mouseover", (e) => {
-      const span = e.target.closest && e.target.closest("span[data-unit-id]");
-      showTip(span ? span.getAttribute("data-unit-id") : null, e);
+      const span = unitSpanAt(e.target);
+      showTip(span ? unitIdOf(span) : null, e);
     });
     map.addEventListener("mousemove", (e) => {
       if (ui.tip.style.display === "block") placeTip(e);
@@ -919,7 +953,7 @@
   let highlighted = null;
   function highlight(id) {
     if (highlighted) highlighted.classList.remove("kt-hl");
-    highlighted = id ? document.querySelector(`#gamemap span[data-unit-id='${id}']`) : null;
+    highlighted = id ? unitSpanById(id) : null;
     if (highlighted) highlighted.classList.add("kt-hl");
   }
 
@@ -979,8 +1013,8 @@
   }
 
   function renderBadges() {
-    for (const span of document.querySelectorAll("#gamemap span[data-unit-id]")) {
-      const s = ui.badges && enabled ? T.stats[T.root(+span.getAttribute("data-unit-id"))] : null;
+    for (const span of unitSpans()) {
+      const s = ui.badges && enabled ? T.stats[T.root(+unitIdOf(span))] : null;
       setBadge(span, "kt-badge-k", s && s.kills ? String(s.kills) : "");
       setBadge(span, "kt-badge-d", s && s.dmg ? String(s.dmg) : "");
     }
@@ -1064,9 +1098,11 @@
   const pi = page.playersInfo();
   if (pi) absorbPlayers(pi);
   // Hooks first so nothing played while history loads is missed; game.js may still be initialising.
-  const hooksReady = (async () => {
-    for (let i = 0; i < 50 && !installHooks(); i++) await sleep(200);
-    if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; live updates disabled");
-  })();
+  const hooksReady = IS_PLANNER
+    ? Promise.resolve()
+    : (async () => {
+        for (let i = 0; i < 50 && !installHooks(); i++) await sleep(200);
+        if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; live updates disabled");
+      })();
   buildUI(); // mounting the panel calls setEnabled with the remembered on/off state
 })();

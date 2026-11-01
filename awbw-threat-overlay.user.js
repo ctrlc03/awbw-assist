@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         AWBW Threat Overlay
 // @namespace    awbw-threat-overlay
-// @version      1.1.0
+// @version      1.2.0
 // @description  Highlights every tile that visible enemy units could attack on their next turn (move + fire for direct units, current range for indirect units) on Advance Wars By Web.
 // @homepageURL  https://github.com/ctrlc03/awbw-assist
 // @supportURL   https://github.com/ctrlc03/awbw-assist/issues
 // @updateURL    https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-threat-overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-threat-overlay.user.js
 // @match        https://awbw.amarriner.com/game.php*
+// @match        https://awbw.amarriner.com/moveplanner.php*
 // @run-at       document-idle
 // @grant        none
 // @sandbox      raw
@@ -17,12 +18,16 @@
 (function () {
   "use strict";
 
+  const IS_PLANNER = /\/moveplanner\.php$/.test(location.pathname);
+  const QUERY = new URLSearchParams(location.search);
+  // The map-design planner (moveplanner.php?maps_id=N) has no game data: stay inactive there.
+  if (IS_PLANNER && !QUERY.get("games_id")) return;
   if (!document.getElementById("gamemap")) return;
 
   const LOG = "[AWBW threat overlay]";
   const LS = "awbw-to:";
   const TILE = 16; // px per map tile (game.js: unit spans are left = x * 16, top = y * 16)
-  const GAME_ID = +new URLSearchParams(location.search).get("games_id") || 0;
+  const GAME_ID = +QUERY.get("games_id") || 0;
 
   // Defender classes, as a bitmask. Derived from units_movement_type:
   // A = air; S (ship) and L (lander) = sea; F, B, T, W, P (foot, boots, treads, wheels, pipe) = ground.
@@ -40,7 +45,7 @@
   // and can sit in the temporal dead zone while the page boots, so every read happens inside try/catch.
   // ---------------------------------------------------------------------------
 
-  function page() {
+  function pageGame() {
     try {
       /* eslint-disable no-undef */
       const dsOlaf = typeof GAME_FLAGS__JJ__DS_OLAF !== "undefined" && Boolean(GAME_FLAGS__JJ__DS_OLAF);
@@ -63,8 +68,280 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Movement without game.js (Move Planner). Re-implements draw_movement.js getMovementTiles/findTerrainCost
+  // (draw=false) over the page's terrainInfo/buildingsInfo. Clear-weather costs are the game's own moveCosts table
+  // (identical in game_1714311 and game_finished_fog, 197 terrain ids); rain/snow costs are derived from the
+  // official Terrain Chart (awbw.amarriner.com/terrain.php).
+  // ---------------------------------------------------------------------------
+
+  // Clear-weather cost per movement type, order F B T W A S L P (0 = impassable), -> terrain ids.
+  const CLEAR_COSTS = {
+    "00000000": "195",
+    "00000001": "101-110,113-114",
+    "00001110": "28",
+    "00001220": "33",
+    "11111000":
+      "15-27,34,36,38,40,42-43,45,47-48,50,52-53,55,57,81,83,85-86,88,90-91,93,95-96,98,100,111-112,117,119-120,122,124-125,127-149,151-154,156,158-161,163,165-168,170,172-175,181,183-186,188,190-193,196,198-201,203,205-208,210,212-215,217,219-222",
+    "11111001": "35,39,44,49,54,82,87,92,97,118,123,150,157,164,171,182,189,197,204,211,218",
+    "11111010": "29-32",
+    "11111110": "37,41,46,51,56,84,89,94,99,121,126,155,162,169,176,187,194,202,209,216,223",
+    "11121000": "1,115-116",
+    "11231000": "3",
+    "21001000": "2,4-14",
+  };
+  const COST_BY_ID = new Map();
+  for (const vec in CLEAR_COSTS) {
+    for (const part of CLEAR_COSTS[vec].split(",")) {
+      const [a, b] = part.split("-").map(Number);
+      for (let i = a; i <= (b == null ? a : b); i++) COST_BY_ID.set(i, vec);
+    }
+  }
+  const MT_INDEX = { F: 0, B: 1, T: 2, W: 3, A: 4, S: 5, L: 6, P: 7 };
+
+  // Cost of terrain `id` for movement type `mType` in weather w ("C", "R" or "S"); undefined = unknown terrain.
+  function tableCost(id, w, mType) {
+    const vec = COST_BY_ID.get(id);
+    const i = MT_INDEX[mType];
+    if (vec === undefined || i === undefined) return undefined;
+    const c = +vec[i];
+    if (!c || (w !== "R" && w !== "S")) return c;
+    const plain = vec === "11121000";
+    const wood = vec === "11231000";
+    if (w === "R") return (mType === "T" || mType === "W") && (plain || wood) ? c + 1 : c;
+    const mountain = id === 2;
+    const portOrSea = id === 28 || vec === "11111110";
+    switch (mType) {
+      case "A":
+        return c * 2;
+      case "F":
+        return plain || wood || mountain ? c * 2 : c;
+      case "B":
+        return mountain ? c * 2 : c;
+      case "T":
+      case "W":
+        return plain ? c + 1 : c;
+      case "S":
+      case "L":
+        return portOrSea ? c * 2 : c;
+      default:
+        return c;
+    }
+  }
+
+  // env = { mx, my, weather, dsOlaf, terrain, buildings, teamAt(x, y) }.
+  // Returns the tiles the unit could land on, like getMovementTiles(...).tilesToDraw: start tile included,
+  // teleport tiles excluded, enemy-team units block, own-team units can be passed through.
+  function ownMovementTiles(env, mType, mp, start, team, player) {
+    const { mx, my } = env;
+    const n = mx * my;
+    const co = player && player.co_name;
+    const power = player && player.players_co_power_on;
+    // Weather as findTerrainCost resolves it for this CO.
+    let w = env.weather;
+    const isSnow = w === "S" || w === "2" || w === "1";
+    const isDsSnow = w === "2" || w === "1" || (env.dsOlaf && w === "S");
+    if (co === "Olaf" && isSnow) w = "C";
+    if (co === "Olaf" && w === "R" && !env.dsOlaf) w = "S";
+    if (co === "Drake" && w === "R") w = "C";
+    if (isDsSnow) w = "C";
+    const flatCost = !!(w !== "S" && !isDsSnow && (co === "Sturm" || (co === "Lash" && power !== "N")));
+    const teamStr = String(team);
+
+    const UNKNOWN = -3;
+    const ENEMY = -1;
+    const cost = new Int8Array(n).fill(UNKNOWN);
+    const tele = new Uint8Array(n);
+    const costAt = (x, y, idx) => {
+      let c = cost[idx];
+      if (c !== UNKNOWN) return c;
+      const t = env.teamAt(x, y);
+      if (t && String(t) !== teamStr) c = ENEMY;
+      else {
+        const ti = env.terrain[x] && env.terrain[x][y];
+        const bi = env.buildings[x] && env.buildings[x][y];
+        const id = Number((ti && ti.terrain_id) || (bi && bi.terrain_id));
+        let m = tableCost(id, w, mType);
+        if (m === undefined) m = 0; // unknown tile: the game treats it as cost 0 = impassable
+        if (m && flatCost) m = 1;
+        c = m;
+        if (ti && Number(ti.terrain_id) === 195) tele[idx] = 1;
+      }
+      cost[idx] = c;
+      return c;
+    };
+
+    mp = Math.max(0, Math.floor(Number(mp) || 0));
+    const INF = 1e9;
+    const dist = new Int32Array(n).fill(INF);
+    const listed = new Uint8Array(n);
+    const s = start.y * mx + start.x;
+    dist[s] = 0;
+    listed[s] = 1;
+    const out = [{ x: start.x, y: start.y }];
+    const buckets = [];
+    for (let i = 0; i <= mp; i++) buckets.push([]);
+    buckets[0].push(s);
+    const DX = [-1, 1, 0, 0];
+    const DY = [0, 0, -1, 1];
+    for (let d = 0; d <= mp; d++) {
+      const b = buckets[d];
+      for (let k = 0; k < b.length; k++) {
+        const idx = b[k];
+        if (dist[idx] !== d) continue;
+        const x = idx % mx;
+        const y = (idx - x) / mx;
+        for (let q = 0; q < 4; q++) {
+          const ax = x + DX[q];
+          const ay = y + DY[q];
+          if (ax < 0 || ay < 0 || ax >= mx || ay >= my) continue;
+          const ni = ay * mx + ax;
+          const c = costAt(ax, ay, ni);
+          if (c === ENEMY || (c === 0 && !tele[ni])) continue;
+          const nd = d + c;
+          if (nd < dist[ni] && nd <= mp) {
+            dist[ni] = nd;
+            buckets[nd].push(ni);
+            if (!tele[ni] && !listed[ni]) {
+              listed[ni] = 1;
+              out.push({ x: ax, y: ay });
+            }
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  const gameEnv = () => {
+    /* eslint-disable no-undef */
+    return {
+      mx: maxX,
+      my: maxY,
+      weather: gameWeather.code,
+      dsOlaf: typeof GAME_FLAGS__JJ__DS_OLAF !== "undefined" && Boolean(GAME_FLAGS__JJ__DS_OLAF),
+      terrain: terrainInfo,
+      buildings: buildingsInfo,
+      teamAt: (x, y) => unitMap[x] && unitMap[x][y] && unitMap[x][y].team,
+    };
+    /* eslint-enable no-undef */
+  };
+
+  // ---- Move Planner page state --------------------------------------------------------------
+
+  let plannerDmg = null;
+  let plannerDmgLoading = false;
+  function loadPlannerDamage() {
+    if (plannerDmg || plannerDmgLoading) return;
+    plannerDmgLoading = true;
+    fetch("js/damage_inc.json", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
+      .then((d) => {
+        plannerDmg = d;
+        recompute(true);
+      })
+      .catch((err) => {
+        console.warn(LOG, "could not load damage tables, retrying", err);
+        setTimeout(() => {
+          plannerDmgLoading = false;
+          loadPlannerDamage();
+        }, 5000);
+      });
+  }
+
+  // The planner's unitsInfo is edited by moveplanner.js: units built there only carry a handful of fields
+  // (players_id, units_name, position, hp, ammo), and its unitMap is not kept in sync. Rebuild both.
+  function pagePlanner() {
+    try {
+      /* eslint-disable no-undef */
+      const raw = unitsInfo;
+      const players = playersInfo;
+      const generic = genericUnits;
+      if (!raw || !players || !generic || !terrainInfo || !buildingsInfo) return null;
+      const mx = maxX;
+      const my = maxY;
+      const wcode = typeof weatherCode === "undefined" ? "C" : weatherCode;
+      const dsOlaf = typeof GAME_FLAGS__JJ__DS_OLAF !== "undefined" && Boolean(GAME_FLAGS__JJ__DS_OLAF);
+      const byCountry = {};
+      let turn = 0;
+      let latest = "";
+      for (const pid in players) {
+        const p = players[pid];
+        if (p.countries_code) byCountry[p.countries_code] = pid;
+        // The player on turn is the one whose turn started last (matches game.php currentTurn, also in finished games).
+        if (p.players_turn_start && p.players_turn_start > latest) {
+          latest = p.players_turn_start;
+          turn = +pid;
+        }
+      }
+      const units = {};
+      const teamGrid = new Array(mx * my);
+      for (const id in raw) {
+        const u = raw[id];
+        const gen = u && generic[u.units_name];
+        if (!gen) continue;
+        const pid = u.units_players_id != null ? u.units_players_id : u.players_id != null ? u.players_id : byCountry[u.countries_code];
+        const pick = (k) => (u[k] != null ? u[k] : gen[k]);
+        const nu = {
+          units_id: u.units_id != null ? u.units_id : +id,
+          units_name: u.units_name,
+          units_players_id: pid,
+          units_x: u.units_x,
+          units_y: u.units_y,
+          units_hit_points: u.units_hit_points,
+          units_carried: u.units_carried || "N",
+          units_ammo: pick("units_ammo"),
+          units_fuel: pick("units_fuel"),
+          units_movement_points: pick("units_movement_points"),
+          units_movement_type: pick("units_movement_type"),
+          units_short_range: pick("units_short_range"),
+          units_long_range: pick("units_long_range"),
+        };
+        units[id] = nu;
+        const x = +nu.units_x;
+        const y = +nu.units_y;
+        const owner = players[pid];
+        if (nu.units_carried !== "Y" && owner && x >= 0 && y >= 0 && x < mx && y < my) teamGrid[y * mx + x] = owner.players_team;
+      }
+      const env = { mx, my, weather: wcode, dsOlaf, terrain: terrainInfo, buildings: buildingsInfo, teamAt: (x, y) => teamGrid[y * mx + x] };
+      return {
+        planner: true,
+        env,
+        units,
+        players,
+        generic,
+        mx,
+        my,
+        weather: { code: wcode },
+        turn,
+        viewer: 0,
+        dsOlaf,
+        dmg: plannerDmg,
+        getMovementTiles: (_mx, _my, mType, mp, start, team, player) => ({ tilesToDraw: ownMovementTiles(env, mType, mp, start, team, player) }),
+      };
+      /* eslint-enable no-undef */
+    } catch (_) {
+      return null;
+    }
+  }
+
+  const page = () => (IS_PLANNER ? pagePlanner() : pageGame());
+
   const ready = (g) =>
     g && g.units && g.players && g.generic && g.mx > 0 && g.my > 0 && g.weather && g.dmg && g.dmg.ATTACK1 && g.dmg.ATTACK2 && typeof g.getMovementTiles === "function";
+
+  // Id of the unit under an event target. Game: span[data-unit-id]; planner: span#unit_<id> (its icons are unit_<id>rightIcon etc.).
+  function unitIdFromTarget(t) {
+    if (!IS_PLANNER) {
+      const span = t && t.closest ? t.closest("span[data-unit-id]") : null;
+      return span ? +span.getAttribute("data-unit-id") : null;
+    }
+    for (let el = t; el && el.id !== "gamemap"; el = el.parentElement) {
+      const m = /^unit_(\d+)$/.exec(el.id || "");
+      if (m) return +m[1];
+    }
+    return null;
+  }
 
   // ---------------------------------------------------------------------------
   // Threat computation (pure with respect to the DOM)
@@ -701,9 +978,11 @@
         return `<option value="${esc(pid)}">${esc(p.users_username || pid)} — ${esc(p.co_name || "?")}${you}${dead}</option>`;
       })
       .join("");
-    // Default perspective: the viewing player; spectators get the first live player. A saved choice wins.
+    // Default perspective: the viewing player; on the move planner the player whose turn it is; otherwise the first
+    // live player. A saved choice wins.
     let want = +store.get("persp:" + GAME_ID, 0);
     if (!want || !g.players[want]) want = g.viewer && g.players[g.viewer] ? +g.viewer : 0;
+    if (!want && g.planner && g.turn && g.players[g.turn] && g.players[g.turn].players_eliminated !== "Y") want = +g.turn;
     if (!want) {
       const live = pids.find((pid) => g.players[pid].players_eliminated !== "Y");
       want = +(live || pids[0]);
@@ -797,6 +1076,12 @@
     for (const id in g.units) {
       const u = g.units[id];
       s += ";" + id + "," + u.units_x + "," + u.units_y + "," + u.units_carried + "," + u.units_ammo + "," + u.units_fuel + "," + u.units_movement_points + "," + u.units_long_range;
+      if (g.planner) s += "," + u.units_hit_points + "," + u.units_players_id;
+    }
+    if (g.planner) {
+      // The planner lets the user change building types and owners, which changes movement costs.
+      const b = g.env.buildings;
+      for (const x in b) for (const y in b[x]) s += "|" + b[x][y].terrain_id;
     }
     return s;
   }
@@ -906,8 +1191,7 @@
   // takes pointer events, so all of this is driven by listeners on the map and the window.
   function onMapMove(e) {
     if (!ui.enabled) return;
-    const span = e.target && e.target.closest ? e.target.closest("span[data-unit-id]") : null;
-    const id = span ? +span.getAttribute("data-unit-id") : null;
+    const id = unitIdFromTarget(e.target);
     if (!ui.inMap || id !== ui.over || e.shiftKey !== ui.shift) {
       ui.inMap = true;
       ui.over = id;
@@ -935,14 +1219,15 @@
 
   // ---- boot --------------------------------------------------------------------------
 
-  // Test/debug handle (read-only helpers): window.__awbwThreat.compute(pid) returns the raw computation.
-  window.__awbwThreat = { compute: computeThreats, aggregate, state, ui, recompute };
-
   buildUI(); // mounting the panel calls setEnabled with the remembered on/off state
   (async () => {
+    if (IS_PLANNER) {
+      loadPlannerDamage(); // the planner has no game.js: damage tables come from the same endpoint game.js uses
+      return;
+    }
     // The page may still be initialising (globals in TDZ, actionHandlers, damage tables fetched async).
     for (let i = 0; i < 100 && !installHooks(); i++) await new Promise((r) => setTimeout(r, 200));
     if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; relying on polling only");
   })();
-  setInterval(poll, 1500);
+  setInterval(poll, IS_PLANNER ? 350 : 1500);
 })();

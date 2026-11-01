@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         AWBW Fog Memory
 // @namespace    awbw-fog-memory
-// @version      1.1.0
+// @version      1.2.0
 // @description  Remembers enemy units you have seen in fog-of-war games and draws faded "ghost" markers (with the day last seen) where they disappeared.
 // @homepageURL  https://github.com/ctrlc03/awbw-assist
 // @supportURL   https://github.com/ctrlc03/awbw-assist/issues
 // @updateURL    https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-fog-memory.user.js
 // @downloadURL  https://raw.githubusercontent.com/ctrlc03/awbw-assist/main/awbw-fog-memory.user.js
 // @match        https://awbw.amarriner.com/game.php*
+// @match        https://awbw.amarriner.com/moveplanner.php*
 // @run-at       document-idle
 // @grant        none
 // @sandbox      raw
@@ -24,8 +25,11 @@
   const STORE_INDEX = "awbw-fm:index";
   const MAX_STORED_GAMES = 40;
   const POLL_MS = 1000;
+  // moveplanner.php: read-only view of the memory stored by game.php (nothing is recorded there).
+  const PLANNER = /\/moveplanner\.php$/.test(location.pathname);
   const GAME_ID = +new URLSearchParams(location.search).get("games_id");
-  if (!GAME_ID) return;
+  if (!GAME_ID) return; // also covers moveplanner.php?maps_id= (no game data)
+  if (PLANNER && (typeof unitsInfo === "undefined" || !unitsInfo)) return; // eslint-disable-line no-undef
 
   // ---------------------------------------------------------------------------
   // Page access. Inline game.php globals are let/const (bare names, not window properties);
@@ -41,9 +45,9 @@
     gameDay: () => (typeof gameDay !== "undefined" ? +gameDay || 0 : 0),
     gameEndDate: () => (typeof gameEndDate !== "undefined" ? gameEndDate : ""),
     freezeGame: () => (typeof freezeGame !== "undefined" ? !!freezeGame : false),
-    fogInfo: () => (typeof fogInfo !== "undefined" ? fogInfo : null),
+    fogInfo: () => (PLANNER ? (typeof fogArray !== "undefined" ? fogArray : null) : typeof fogInfo !== "undefined" ? fogInfo : null),
     viewerColors: () => (typeof viewerColors !== "undefined" ? viewerColors : null),
-    tp: () => (typeof TP !== "undefined" ? TP : "terrain/aw1/"),
+    tp: () => (typeof TP !== "undefined" ? TP : typeof terrainPath !== "undefined" ? terrainPath : "terrain/aw1/"),
     spriteVersion: () => (typeof SPRITE_VERSION !== "undefined" ? SPRITE_VERSION : ""),
     moveMs: () => (typeof movementSpeed !== "undefined" && +movementSpeed > 0 ? +movementSpeed : 200),
   };
@@ -53,9 +57,10 @@
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // viewerPId is fixed for the lifetime of a page; it keys the stored memory.
-  const VIEWER = page.viewerPId();
-  const STORE_KEY = STORE_PREFIX + GAME_ID + ":" + VIEWER;
+  // viewerPId is fixed for the lifetime of a game page; it keys the stored memory.
+  // On the planner there is no viewerPId: plannerScan() picks the stored key.
+  const VIEWER = PLANNER ? 0 : page.viewerPId();
+  let STORE_KEY = STORE_PREFIX + GAME_ID + ":" + VIEWER;
 
   // ---------------------------------------------------------------------------
   // Memory
@@ -89,8 +94,32 @@
     }
   }
 
+  // ---- planner: choose which stored memory to show --------------------------------
+  const PLANNER_PICK = "awbw-fm:plannerView:" + GAME_ID;
+  let plannerKeys = []; // [{ key, pid, n, saved }], newest first
+  function plannerScan() {
+    const pre = STORE_PREFIX + GAME_ID + ":";
+    plannerKeys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(pre) || !+k.slice(pre.length)) continue;
+      try {
+        const c = JSON.parse(localStorage.getItem(k));
+        plannerKeys.push({ key: k, pid: +k.slice(pre.length), n: Object.keys((c && c.mem) || {}).length, saved: (c && c.saved) || 0 });
+      } catch (_) {}
+    }
+    plannerKeys.sort((a, b) => b.saved - a.saved);
+    const pi = page.playersInfo() || {};
+    const want = localStorage.getItem(PLANNER_PICK);
+    const pick = plannerKeys.find((e) => e.key === want) || plannerKeys.find((e) => pi[e.pid]) || plannerKeys[0];
+    STORE_KEY = pick ? pick.key : "";
+    S.mem = {};
+    if (pick) loadMem();
+    return pick || null;
+  }
+
   function saveNow() {
-    if (!enabled) {
+    if (!enabled || PLANNER) {
       clearTimeout(S.saveTimer);
       S.saveTimer = 0;
       return;
@@ -120,11 +149,13 @@
   }
 
   function markDirty() {
+    if (PLANNER) return;
     S.dirty = true;
     if (!S.saveTimer) S.saveTimer = setTimeout(saveNow, 800);
   }
 
   function clearGameMemory() {
+    if (PLANNER) return;
     S.mem = {};
     S.dead.clear();
     S.holdGone = {};
@@ -145,6 +176,13 @@
 
   function mode() {
     if (!enabled) return { ok: false, msg: "Switched off." };
+    if (PLANNER) {
+      if (!plannerKeys.length) {
+        return { ok: false, msg: "No fog memory stored for this game in this browser. It is recorded on game.php while you play a fog game as a player (spectators and non-fog games have none)." };
+      }
+      const cur = plannerKeys.find((e) => e.key === STORE_KEY);
+      return { ok: true, msg: `Read-only: units remembered on game.php${cur ? " by " + ownerName(cur.pid) : ""}. Nothing is recorded here.` };
+    }
     if (page.gameFog() !== "Y") return { ok: false, msg: "Not a fog game — nothing to remember." };
     if (page.gameEndDate()) return { ok: false, msg: "Game over: vision is shared, every unit is visible." };
     if (!page.viewerPId()) return { ok: false, msg: "Spectating: no fog applies to you, nothing is hidden." };
@@ -237,7 +275,7 @@
 
   // Walks game.js's own unit table: refreshes sightings, detects units that just left vision.
   function reconcile() {
-    if (!mode().ok) return;
+    if (PLANNER || !mode().ok) return;
     const units = page.unitsInfo();
     if (!units) return;
     const day = page.gameDay();
@@ -521,11 +559,29 @@
   // ---------------------------------------------------------------------------
   // Derived view of remembered units
   // ---------------------------------------------------------------------------
-  const STATUS_ORDER = { ghost: 0, out: 1, hidden: 2, moved: 3, carried: 4 };
-  const STATUS_TEXT = { ghost: "ghost", out: "left sight", hidden: "hidden", moved: "moved", carried: "carried" };
+  const STATUS_ORDER = { ghost: 0, out: 1, hidden: 2, occupied: 3, moved: 4, carried: 5 };
+  const STATUS_TEXT = { ghost: "ghost", out: "left sight", hidden: "hidden", occupied: "occupied", moved: "moved", carried: "carried" };
+
+  // Planner: tiles currently holding one of the planner's own unit spans (hypothetical positions).
+  function occupied() {
+    const s = new Set();
+    for (const sp of document.querySelectorAll("#gamemap > span[id^='unit_']")) {
+      const l = parseFloat(sp.style.left);
+      const t = parseFloat(sp.style.top);
+      if (!isNaN(l) && !isNaN(t)) s.add(Math.floor(l / 16) + "," + Math.floor(t / 16));
+    }
+    return s;
+  }
 
   // Position of a remembered unit's transport, if known.
   function carrierInfo(m) {
+    if (PLANNER) {
+      const sp = document.getElementById("unit_" + m.by);
+      if (sp) {
+        const r = S.mem[m.by];
+        return { name: r ? r.name : "transport", x: Math.floor(parseFloat(sp.style.left) / 16), y: Math.floor(parseFloat(sp.style.top) / 16), live: true };
+      }
+    }
     const t = (page.unitsInfo() || {})[m.by];
     if (t) return { name: t.units_name, x: num(t.units_x), y: num(t.units_y), live: true };
     const r = S.mem[m.by];
@@ -535,9 +591,10 @@
 
   function entries() {
     const out = [];
+    const occ = PLANNER ? occupied() : null;
     for (const k in S.mem) {
       const m = S.mem[k];
-      if (m.vis) continue; // on the map: game.js draws it
+      if (PLANNER ? !!document.getElementById("unit_" + k) : m.vis) continue; // on the map: game.js / the planner draws it
       const e = { id: +k, m, x: m.x, y: m.y, show: true, status: "ghost", carrier: null };
       if (m.by) {
         e.status = "carried";
@@ -557,6 +614,10 @@
           e.status = "out"; // it walked out of vision from here; the tile has been in sight ever since
         }
       }
+      if (PLANNER && e.show && !m.by && occ.has(e.x + "," + e.y)) {
+        e.status = "occupied"; // a planner unit stands here now
+        e.show = false;
+      }
       out.push(e);
     }
     out.sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.m.day - a.m.day || a.m.name.localeCompare(b.m.name) || a.id - b.id);
@@ -572,7 +633,10 @@
       S.saveTimer = 0;
       ui.hl = null;
     }
-    if (on) reconcile();
+    if (on) {
+      if (PLANNER) plannerScan();
+      else reconcile();
+    }
     renderAll();
   }
 
@@ -855,6 +919,7 @@
     ui.note.style.display = md.msg ? "" : "none";
     ui.controls.style.display = md.ok ? "" : "none";
     ui.panel.querySelector(".fm-scroll").style.display = md.ok ? "" : "none";
+    if (PLANNER) renderPicker();
     if (!md.ok) {
       setRows("");
       return;
@@ -875,8 +940,21 @@
               return `<tr data-id="${e.id}" class="fm-r-${e.status}" title="${esc(title)}"><td>${esc(m.name)}</td><td>${esc(ownerName(m.pid))}</td><td>${pos} D${m.day}</td><td>${m.hp != null ? m.hp : "?"}</td><td class="fm-st">${esc(status)}</td></tr>`;
             })
             .join("")
-        : `<tr><td colspan="5" class="fm-empty">No remembered enemy units yet. Units you see are remembered once they vanish into fog.</td></tr>`
+        : `<tr><td colspan="5" class="fm-empty">${
+            PLANNER ? "Nothing remembered for this player: no enemy unit has vanished into fog yet." : "No remembered enemy units yet. Units you see are remembered once they vanish into fog."
+          }</td></tr>`
     );
+  }
+
+  // Planner only: which player's stored memory to show (a selector appears when several are stored).
+  let lastPicker = "";
+  function renderPicker() {
+    const sel = ui.who;
+    const sig = JSON.stringify(plannerKeys.map((e) => [e.key, e.n])) + STORE_KEY;
+    if (sig === lastPicker) return;
+    lastPicker = sig;
+    sel.style.display = plannerKeys.length > 1 ? "" : "none";
+    sel.innerHTML = plannerKeys.map((e) => `<option value="${esc(e.key)}"${e.key === STORE_KEY ? " selected" : ""}>${esc(ownerName(e.pid))} (${e.n})</option>`).join("");
   }
 
   // The 1 s poll re-renders; only touch the DOM when rows changed so hover/scroll state survives.
@@ -911,6 +989,7 @@
         <div class="fm-note"></div>
         <div class="fm-controls">
           <label title="Draw faded markers on the map for units that vanished into fog"><input type="checkbox" class="fm-show"> ghosts on map</label>
+          <select class="fm-who" style="display:none" title="Whose remembered units to show (stored by game.php)"></select>
           <button class="fm-clear" title="Forget every enemy unit remembered for this game">Clear memory</button>
         </div>
         <div class="fm-scroll"><table>
@@ -924,6 +1003,15 @@
     ui.count = p.querySelector(".fm-count");
     ui.note = p.querySelector(".fm-note");
     ui.controls = p.querySelector(".fm-controls");
+    ui.who = p.querySelector(".fm-who");
+    if (PLANNER) {
+      p.querySelector(".fm-clear").style.display = "none"; // read-only here
+      ui.who.addEventListener("change", () => {
+        localStorage.setItem(PLANNER_PICK, ui.who.value);
+        plannerScan();
+        renderAll();
+      });
+    }
 
     const toggle = p.querySelector(".fm-toggle");
     toggle.textContent = ui.minimized ? "▴" : "▾";
@@ -962,7 +1050,7 @@
     console.error(LOG, err);
   }
 
-  loadMem();
+  if (!PLANNER) loadMem();
   buildUI();
   reconcile();
   renderAll();
@@ -973,8 +1061,17 @@
   // Hooks first (game.js may still be initialising), then a slow poll as backstop for fog changes that arrive
   // without an action of their own (delayed deletions, Sonja/CO vision effects, reconnect resync).
   (async () => {
-    for (let i = 0; i < 50 && !installHooks(); i++) await sleep(200);
-    if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; live updates disabled (polling only)");
+    if (!PLANNER) {
+      for (let i = 0; i < 50 && !installHooks(); i++) await sleep(200);
+      if (!window.actionHandlers) console.warn(LOG, "actionHandlers not found; live updates disabled (polling only)");
+    } else {
+      // the game tab (another browser tab) updates the stored memory while this page is open
+      window.addEventListener("storage", (e) => {
+        if (!enabled || !e.key || !e.key.startsWith(STORE_PREFIX + GAME_ID + ":")) return;
+        plannerScan();
+        renderAll();
+      });
+    }
     setInterval(() => {
       if (!enabled) return;
       try {
